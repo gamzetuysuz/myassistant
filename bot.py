@@ -286,9 +286,31 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
     return f"Bilinmeyen araç: {name}"
 
 
+# --- Conversation History ---
+conversation_history = {}  # user_id -> list of messages
+MAX_HISTORY = 20  # son 20 mesaj tutulur
+
+
+def get_history(user_id: int) -> list:
+    if user_id not in conversation_history:
+        conversation_history[user_id] = []
+    return conversation_history[user_id]
+
+
+def add_to_history(user_id: int, role: str, content):
+    history = get_history(user_id)
+    history.append({"role": role, "content": content})
+    # Geçmişi sınırla (tool_result çiftlerini koruyarak)
+    while len(history) > MAX_HISTORY:
+        history.pop(0)
+
+
 # --- Chat with Claude ---
 def chat_with_claude(user_message: str, user_id: int) -> str:
-    messages = [{"role": "user", "content": user_message}]
+    history = get_history(user_id)
+    history.append({"role": "user", "content": user_message})
+
+    messages = list(history)
 
     for _ in range(5):
         response = claude.messages.create(
@@ -316,7 +338,13 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
             messages.append({"role": "user", "content": tool_results})
         else:
             text_parts = [b.text for b in response.content if b.type == "text"]
-            return "\n".join(text_parts)
+            reply = "\n".join(text_parts)
+            # Başarılı cevabı geçmişe kaydet
+            history.append({"role": "assistant", "content": reply})
+            # Geçmişi sınırla
+            while len(history) > MAX_HISTORY:
+                history.pop(0)
+            return reply
 
     return "Bir hata oluştu, lütfen tekrar dene."
 
