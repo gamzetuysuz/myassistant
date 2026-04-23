@@ -247,13 +247,7 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
         messages = results.get("messages", [])
         if not messages:
             return "Gelen kutusunda email yok."
-        lines = []
-        for msg_ref in messages:
-            msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="metadata",
-                                                  metadataHeaders=["From", "Subject", "Date"]).execute()
-            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-            lines.append(f"- [{headers.get('Date', '?')[:16]}] {headers.get('From', '?')}: {headers.get('Subject', '(konu yok)')}")
-        return "\n".join(lines)
+        return _format_emails(service, messages)
 
     if name == "gmail_ara":
         service = get_gmail_service(user_id)
@@ -264,13 +258,7 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
         messages = results.get("messages", [])
         if not messages:
             return f"'{sorgu}' ile eşleşen email bulunamadı."
-        lines = []
-        for msg_ref in messages:
-            msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="metadata",
-                                                  metadataHeaders=["From", "Subject", "Date"]).execute()
-            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
-            lines.append(f"- [{headers.get('Date', '?')[:16]}] {headers.get('From', '?')}: {headers.get('Subject', '(konu yok)')}")
-        return "\n".join(lines)
+        return _format_emails(service, messages)
 
     if name == "gmail_gonder":
         service = get_gmail_service(user_id)
@@ -284,6 +272,49 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
         return f"Email gönderildi: {input_data['kime']}"
 
     return f"Bilinmeyen araç: {name}"
+
+
+def _format_emails(service, messages):
+    """Email detaylarını thread bilgisi ve içerikle formatla."""
+    lines = []
+    for msg_ref in messages:
+        msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="full",
+                                              metadataHeaders=["From", "To", "Subject", "Date"]).execute()
+        headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+        thread_id = msg.get("threadId", "")
+        labels = msg.get("labelIds", [])
+
+        # Thread'deki mesaj sayısını al (cevap durumu)
+        thread = service.users().threads().get(userId="me", id=thread_id, format="metadata",
+                                                metadataHeaders=["From"]).execute()
+        thread_msgs = thread.get("messages", [])
+        thread_count = len(thread_msgs)
+
+        # Kim cevap vermiş kontrol et
+        senders = [h["value"] for m in thread_msgs for h in m["payload"]["headers"] if h["name"] == "From"]
+
+        # Email içeriğini al (snippet)
+        snippet = msg.get("snippet", "")[:300]
+
+        # Durum belirle
+        if thread_count == 1:
+            durum = "Cevap yok"
+        else:
+            durum = f"{thread_count} mesaj (yazanlar: {', '.join(set(senders))})"
+
+        # Okundu/okunmadı
+        okundu = "Okunmadı" if "UNREAD" in labels else "Okundu"
+
+        lines.append(
+            f"---\n"
+            f"Konu: {headers.get('Subject', '(konu yok)')}\n"
+            f"Kimden: {headers.get('From', '?')}\n"
+            f"Kime: {headers.get('To', '?')}\n"
+            f"Tarih: {headers.get('Date', '?')}\n"
+            f"Durum: {okundu} | {durum}\n"
+            f"Özet: {snippet}"
+        )
+    return "\n".join(lines)
 
 
 # --- Conversation History ---
