@@ -1,7 +1,9 @@
 import os
 import json
 import logging
+import base64
 from datetime import datetime, timezone, timedelta
+from email.mime.text import MIMEText
 
 import anthropic
 import requests
@@ -9,6 +11,11 @@ from dotenv import load_dotenv
 from supabase import create_client
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.discovery import build
 
 load_dotenv(override=True)
 
@@ -18,12 +25,77 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 TAVILY_API_KEY = os.environ.get("TAVILY_API_KEY", "")
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+]
+
+# --- Google OAuth ---
+oauth_flows = {}  # user_id -> Flow (temporary, during auth)
+
+
+def get_google_flow():
+    client_config = {
+        "installed": {
+            "client_id": GOOGLE_CLIENT_ID,
+            "client_secret": GOOGLE_CLIENT_SECRET,
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+        }
+    }
+    return Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
+
+
+def save_google_tokens(user_id: int, creds: Credentials):
+    token_data = {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token,
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+    }
+    existing = supabase.table("google_tokens").select("id").eq("user_id", str(user_id)).execute()
+    if existing.data:
+        supabase.table("google_tokens").update({"tokens": json.dumps(token_data)}).eq("user_id", str(user_id)).execute()
+    else:
+        supabase.table("google_tokens").insert({"user_id": str(user_id), "tokens": json.dumps(token_data)}).execute()
+
+
+def get_google_creds(user_id: int):
+    result = supabase.table("google_tokens").select("tokens").eq("user_id", str(user_id)).execute()
+    if not result.data:
+        return None
+    token_data = json.loads(result.data[0]["tokens"])
+    creds = Credentials(
+        token=token_data["token"],
+        refresh_token=token_data["refresh_token"],
+        token_uri=token_data["token_uri"],
+        client_id=token_data["client_id"],
+        client_secret=token_data["client_secret"],
+        scopes=GOOGLE_SCOPES,
+    )
+    if creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        save_google_tokens(user_id, creds)
+    return creds
+
+
+def get_gmail_service(user_id: int):
+    creds = get_google_creds(user_id)
+    if not creds:
+        return None
+    return build("gmail", "v1", credentials=creds)
+
 
 # --- Tools ---
 TOOLS = [
@@ -65,6 +137,41 @@ TOOLS = [
             "required": ["sorgu"],
         },
     },
+    {
+        "name": "gmail_oku",
+        "description": "Gmail'deki son emailleri okur. Konu, gönderen ve özet bilgisi döndürür.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "adet": {"type": "integer", "description": "Kaç email okunacak (varsayılan 5, max 10)"}
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "gmail_ara",
+        "description": "Gmail'de anahtar kelime ile email arar.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "sorgu": {"type": "string", "description": "Aranacak kelime (konu, gönderen, içerik)"}
+            },
+            "required": ["sorgu"],
+        },
+    },
+    {
+        "name": "gmail_gonder",
+        "description": "Gmail üzerinden email gönderir.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "kime": {"type": "string", "description": "Alıcı email adresi"},
+                "konu": {"type": "string", "description": "Email konusu"},
+                "icerik": {"type": "string", "description": "Email içeriği"},
+            },
+            "required": ["kime", "konu", "icerik"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """Sen yardımsever bir Türkçe asistansın. Kullanıcıya kısa ve net cevaplar ver.
@@ -73,8 +180,12 @@ Elindeki araçlar:
 - not_ekle: Kullanıcının notlarını kaydetmek için
 - not_ara: Kayıtlı notlarda arama yapmak için
 - web_ara: İnternette güncel bilgi aramak için
+- gmail_oku: Son emailleri okumak için
+- gmail_ara: Gmail'de email aramak için
+- gmail_gonder: Email göndermek için
 
-Araçları gerektiğinde kullan. Her zaman Türkçe cevap ver."""
+Araçları gerektiğinde kullan. Her zaman Türkçe cevap ver.
+Gmail araçlarını kullanmadan önce kullanıcının Gmail'i bağlı olmalı. Bağlı değilse /gmail_bagla komutunu kullanmasını söyle."""
 
 
 def run_tool(name: str, input_data: dict, user_id: int) -> str:
@@ -127,6 +238,51 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
             lines.append(f"- {r['title']}: {r['content'][:200]}")
         return "\n".join(lines)
 
+    if name == "gmail_oku":
+        service = get_gmail_service(user_id)
+        if not service:
+            return "Gmail bağlı değil. Önce /gmail_bagla komutunu kullan."
+        adet = min(input_data.get("adet", 5), 10)
+        results = service.users().messages().list(userId="me", maxResults=adet).execute()
+        messages = results.get("messages", [])
+        if not messages:
+            return "Gelen kutusunda email yok."
+        lines = []
+        for msg_ref in messages:
+            msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="metadata",
+                                                  metadataHeaders=["From", "Subject", "Date"]).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            lines.append(f"- [{headers.get('Date', '?')[:16]}] {headers.get('From', '?')}: {headers.get('Subject', '(konu yok)')}")
+        return "\n".join(lines)
+
+    if name == "gmail_ara":
+        service = get_gmail_service(user_id)
+        if not service:
+            return "Gmail bağlı değil. Önce /gmail_bagla komutunu kullan."
+        sorgu = input_data["sorgu"]
+        results = service.users().messages().list(userId="me", q=sorgu, maxResults=5).execute()
+        messages = results.get("messages", [])
+        if not messages:
+            return f"'{sorgu}' ile eşleşen email bulunamadı."
+        lines = []
+        for msg_ref in messages:
+            msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="metadata",
+                                                  metadataHeaders=["From", "Subject", "Date"]).execute()
+            headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
+            lines.append(f"- [{headers.get('Date', '?')[:16]}] {headers.get('From', '?')}: {headers.get('Subject', '(konu yok)')}")
+        return "\n".join(lines)
+
+    if name == "gmail_gonder":
+        service = get_gmail_service(user_id)
+        if not service:
+            return "Gmail bağlı değil. Önce /gmail_bagla komutunu kullan."
+        message = MIMEText(input_data["icerik"])
+        message["to"] = input_data["kime"]
+        message["subject"] = input_data["konu"]
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        service.users().messages().send(userId="me", body={"raw": raw}).execute()
+        return f"Email gönderildi: {input_data['kime']}"
+
     return f"Bilinmeyen araç: {name}"
 
 
@@ -134,7 +290,6 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
 def chat_with_claude(user_message: str, user_id: int) -> str:
     messages = [{"role": "user", "content": user_message}]
 
-    # Claude may request multiple tool calls in a loop
     for _ in range(5):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
@@ -144,9 +299,7 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
             messages=messages,
         )
 
-        # Check if Claude wants to use a tool
         if response.stop_reason == "tool_use":
-            # Collect all text + tool results
             assistant_content = response.content
             messages.append({"role": "assistant", "content": assistant_content})
 
@@ -162,7 +315,6 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
 
             messages.append({"role": "user", "content": tool_results})
         else:
-            # Final text response
             text_parts = [b.text for b in response.content if b.type == "text"]
             return "\n".join(text_parts)
 
@@ -172,8 +324,52 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
 # --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Merhaba! Ben senin AI asistanınım. Sana nasıl yardımcı olabilirim?"
+        "Merhaba! Ben senin AI asistanınım.\n\n"
+        "Yapabileceklerim:\n"
+        "- Soru cevapla\n"
+        "- Not al ve ara\n"
+        "- Web'de ara\n"
+        "- Gmail oku, ara, gönder\n\n"
+        "Gmail için: /gmail_bagla"
     )
+
+
+async def gmail_bagla(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not GOOGLE_CLIENT_ID:
+        await update.message.reply_text("Google OAuth yapılandırılmamış.")
+        return
+    user_id = update.effective_user.id
+    flow = get_google_flow()
+    auth_url, _ = flow.authorization_url(prompt="consent", access_type="offline")
+    oauth_flows[user_id] = flow
+    await update.message.reply_text(
+        f"Gmail'ini bağlamak için:\n\n"
+        f"1. Bu linki aç:\n{auth_url}\n\n"
+        f"2. Google hesabınla giriş yap ve izin ver\n"
+        f"3. Ekrana gelen kodu kopyala\n"
+        f"4. /gmail_kod KODUNUZ yazarak gönder"
+    )
+
+
+async def gmail_kod(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in oauth_flows:
+        await update.message.reply_text("Önce /gmail_bagla komutunu kullan.")
+        return
+    if not context.args:
+        await update.message.reply_text("Kullanım: /gmail_kod KODUNUZ")
+        return
+    code = context.args[0]
+    flow = oauth_flows[user_id]
+    try:
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        save_google_tokens(user_id, creds)
+        del oauth_flows[user_id]
+        await update.message.reply_text("Gmail başarıyla bağlandı! Artık email okuyabilir, arayabilir ve gönderebilirsin.")
+    except Exception as e:
+        logger.error(f"Gmail OAuth error: {e}", exc_info=True)
+        await update.message.reply_text(f"Hata: {e}\n\nTekrar dene: /gmail_bagla")
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -194,6 +390,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("gmail_bagla", gmail_bagla))
+    app.add_handler(CommandHandler("gmail_kod", gmail_kod))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot çalışıyor.")
