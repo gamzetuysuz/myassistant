@@ -346,7 +346,7 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
     for _ in range(5):
         response = claude.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=1024,
+            max_tokens=2048,
             system=SYSTEM_PROMPT,
             tools=TOOLS,
             messages=messages,
@@ -370,11 +370,12 @@ def chat_with_claude(user_message: str, user_id: int) -> str:
         else:
             text_parts = [b.text for b in response.content if b.type == "text"]
             reply = "\n".join(text_parts)
-            # Başarılı cevabı geçmişe kaydet
-            history.append({"role": "assistant", "content": reply})
+            # Tüm mesajları (tool çağrıları dahil) geçmişe kaydet
+            conversation_history[user_id] = messages.copy()
+            conversation_history[user_id].append({"role": "assistant", "content": reply})
             # Geçmişi sınırla
-            while len(history) > MAX_HISTORY:
-                history.pop(0)
+            while len(conversation_history[user_id]) > MAX_HISTORY:
+                conversation_history[user_id].pop(0)
             return reply
 
     return "Bir hata oluştu, lütfen tekrar dene."
