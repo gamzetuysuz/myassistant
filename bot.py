@@ -45,15 +45,15 @@ oauth_flows = {}  # user_id -> Flow (temporary, during auth)
 
 def get_google_flow():
     client_config = {
-        "installed": {
+        "web": {
             "client_id": GOOGLE_CLIENT_ID,
             "client_secret": GOOGLE_CLIENT_SECRET,
             "auth_uri": "https://accounts.google.com/o/oauth2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
-            "redirect_uris": ["urn:ietf:wg:oauth:2.0:oob"],
+            "redirect_uris": ["http://localhost"],
         }
     }
-    return Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES, redirect_uri="urn:ietf:wg:oauth:2.0:oob")
+    return Flow.from_client_config(client_config, scopes=GOOGLE_SCOPES, redirect_uri="http://localhost")
 
 
 def save_google_tokens(user_id: int, creds: Credentials):
@@ -346,8 +346,10 @@ async def gmail_bagla(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Gmail'ini bağlamak için:\n\n"
         f"1. Bu linki aç:\n{auth_url}\n\n"
         f"2. Google hesabınla giriş yap ve izin ver\n"
-        f"3. Ekrana gelen kodu kopyala\n"
-        f"4. /gmail_kod KODUNUZ yazarak gönder"
+        f"3. Sayfa yüklenemez hatası verecek — bu normal!\n"
+        f"4. Tarayıcının adres çubuğundaki URL'den code= sonrasını kopyala\n"
+        f"   (http://localhost?code=BURASI&scope=... → sadece BURASI kısmı)\n"
+        f"5. /gmail_kod KODUNUZ yazarak gönder"
     )
 
 
