@@ -274,35 +274,70 @@ def run_tool(name: str, input_data: dict, user_id: int) -> str:
     return f"Bilinmeyen araç: {name}"
 
 
+def _get_email_body(payload):
+    """Email gövdesini çıkar (plain text veya HTML'den)."""
+    body = ""
+    if payload.get("mimeType") == "text/plain" and payload.get("body", {}).get("data"):
+        body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8", errors="replace")
+    elif payload.get("parts"):
+        for part in payload["parts"]:
+            if part.get("mimeType") == "text/plain" and part.get("body", {}).get("data"):
+                body = base64.urlsafe_b64decode(part["body"]["data"]).decode("utf-8", errors="replace")
+                break
+            elif part.get("parts"):
+                for sub in part["parts"]:
+                    if sub.get("mimeType") == "text/plain" and sub.get("body", {}).get("data"):
+                        body = base64.urlsafe_b64decode(sub["body"]["data"]).decode("utf-8", errors="replace")
+                        break
+                if body:
+                    break
+    return body.strip()[:1500]  # max 1500 karakter
+
+
 def _format_emails(service, messages):
-    """Email detaylarını thread bilgisi ve içerikle formatla."""
+    """Email detaylarını thread bilgisi ve tam içerikle formatla."""
     lines = []
     for msg_ref in messages:
-        msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="full",
-                                              metadataHeaders=["From", "To", "Subject", "Date"]).execute()
+        msg = service.users().messages().get(userId="me", id=msg_ref["id"], format="full").execute()
         headers = {h["name"]: h["value"] for h in msg["payload"]["headers"]}
         thread_id = msg.get("threadId", "")
         labels = msg.get("labelIds", [])
 
-        # Thread'deki mesaj sayısını al (cevap durumu)
-        thread = service.users().threads().get(userId="me", id=thread_id, format="metadata",
-                                                metadataHeaders=["From"]).execute()
+        # Thread bilgisi — tüm mesajları al
+        thread = service.users().threads().get(userId="me", id=thread_id, format="full").execute()
         thread_msgs = thread.get("messages", [])
         thread_count = len(thread_msgs)
 
-        # Kim cevap vermiş kontrol et
-        senders = [h["value"] for m in thread_msgs for h in m["payload"]["headers"] if h["name"] == "From"]
+        # Kim cevap vermiş
+        senders = set()
+        for m in thread_msgs:
+            for h in m["payload"]["headers"]:
+                if h["name"] == "From":
+                    senders.add(h["value"])
 
-        # Email içeriğini al (snippet)
-        snippet = msg.get("snippet", "")[:300]
+        # Email gövdesini oku
+        body = _get_email_body(msg["payload"])
+        if not body:
+            body = msg.get("snippet", "")
 
-        # Durum belirle
+        # Thread'deki tüm cevapları da oku
+        thread_summary = ""
+        if thread_count > 1:
+            thread_parts = []
+            for tm in thread_msgs:
+                tm_headers = {h["name"]: h["value"] for h in tm["payload"]["headers"]}
+                tm_body = _get_email_body(tm["payload"])
+                if not tm_body:
+                    tm_body = tm.get("snippet", "")
+                thread_parts.append(f"  > {tm_headers.get('From', '?')} ({tm_headers.get('Date', '?')[:16]}):\n  {tm_body[:500]}")
+            thread_summary = "\nKonuşma geçmişi:\n" + "\n".join(thread_parts)
+
+        # Durum
         if thread_count == 1:
             durum = "Cevap yok"
         else:
-            durum = f"{thread_count} mesaj (yazanlar: {', '.join(set(senders))})"
+            durum = f"{thread_count} mesaj (yazanlar: {', '.join(senders)})"
 
-        # Okundu/okunmadı
         okundu = "Okunmadı" if "UNREAD" in labels else "Okundu"
 
         lines.append(
@@ -312,7 +347,8 @@ def _format_emails(service, messages):
             f"Kime: {headers.get('To', '?')}\n"
             f"Tarih: {headers.get('Date', '?')}\n"
             f"Durum: {okundu} | {durum}\n"
-            f"Özet: {snippet}"
+            f"İçerik:\n{body}"
+            f"{thread_summary}"
         )
     return "\n".join(lines)
 
